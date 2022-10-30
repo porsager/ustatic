@@ -1,0 +1,33 @@
+{
+  "name": "ustatic",
+  "version": "0.0.0",
+  "description": "A static file serve handler for uWebSockets.js",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "test": "echo some day"
+  },
+  "files": [
+    "/index.js",
+    "/mimes.js"
+  ],
+  "author": "Rasmus Porsager <rasmus@porsager.com> (https://www.porsager.com)",
+  "funding": {
+    "type": "individual",
+    "url": "https://github.com/sponsors/porsager"
+  },
+  "license": "Unlicense",
+  "repository": "porsager/ustatic",
+  "homepage": "https://github.com/porsager/ustatic",
+  "bugs": "https://github.com/porsager/ustatic/issues",
+  "keywords": [
+    "static",
+    "serve",
+    "public",
+    "file",
+    "streaming",
+    "compression",
+    "uws",
+    "uWebSockets"
+  ]
+}
