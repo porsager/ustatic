@@ -1,4 +1,5 @@
-import fs from 'fs/promises'
+import fs from 'fs'
+import fsp from 'fs/promises'
 import mimes, { compressable } from './mimes.js'
 import path from 'path'
 import zlib from 'zlib'
@@ -11,6 +12,8 @@ const encoders = {
   br: promisify(zlib.brotliCompress)
 }
 
+const indexes = new Map()
+
 const caches = {
   deflate: new Map(),
   gzip: new Map(),
@@ -18,33 +21,58 @@ const caches = {
   identity: new Map()
 }
 
-export default function(folder = '', {
-  base = '',
-  secure = false,
-  encodings = secure ? ['br', 'gzip', 'deflate'] : ['gzip', 'deflate'],
-  index = 'index.html',
-  lastModified = true,
-  cache = true,
-  notFound = notFoundHandler,
-  internalError = internalErrorHandler,
-  transform = null
-} = {}) {
-  const indexHandler = typeof index === 'function' && index
-  const root = path.isAbsolute(folder) ? folder : path.join(process.cwd(), folder)
+export default function(folder = '', options = {}) {
+  const {
+    base = '',
+    root = path.isAbsolute(folder) ? folder : path.join(process.cwd(), folder),
+    index = indexHandler,
+    secure = false,
+    encodings = secure ? ['br', 'gzip', 'deflate'] : ['gzip', 'deflate'],
+    lastModified = true,
+    cache = true,
+    notFound = notFoundHandler,
+    internalError = internalErrorHandler,
+    transform = null
+  } = options
+
   const urlIndex = 1 + (root === folder ? 0 : base.length)
 
-  return function files(res, req) {
-    const pathname = req.getUrl().slice(urlIndex)
-        , urlExt = path.extname(pathname).slice(1)
+  return (res, req) => {
+    res.url = decodeURIComponent(req.getUrl().slice(urlIndex))
+    res.ext = path.extname(res.url).slice(1)
+    res.accept = req.getHeader('accept')
+    !res.ext && index
+      ? rewrite(res, req, index(res, req, indexHandler, root))
+      : file(res, req)
+  }
 
-    if (!urlExt && indexHandler)
-      return indexHandler(res, req)
+  async function rewrite(res, req, rewritten) {
+    if (rewritten === true)
+      return
 
-    const file = path.join(root, ...pathname.split('/'), urlExt ? '' : index)
-        , type = mimes.get(urlExt) || mimes.get(path.extname(file))
+    if (rewritten === false)
+      return file(res, req)
+
+    if (typeof rewritten === 'string')
+      return file(res, req, absolute(root, rewritten))
+
+    res.onAborted(() => res.aborted = true)
+    try {
+      rewritten = await rewritten
+      res.aborted || (typeof rewritten === 'string'
+        ? file(res, req, absolute(root, rewritten))
+        : notFound(res, req, notFoundHandler)
+      )
+    } catch (error) {
+      res.aborted || internalError(res, req, error)
+    }
+  }
+
+  function file(res, req, file = absolute(root, res.url)) {
+    const type = mimes.get(res.ext) || mimes.get(path.extname(file))
 
     if (file.indexOf(root) !== 0)
-      return notFound(res, req)
+      return notFound(res, req, notFoundHandler)
 
     const range = req.getHeader('range')
 
@@ -59,13 +87,11 @@ export default function(folder = '', {
   }
 
   async function read(res, req, file, type, encoding) {
-    let aborted
-      , handle
-
-    res.onAborted(() => aborted = true)
+    res.onAborted(() => res.aborted = true)
+    let handle
 
     try {
-      handle = await fs.open(file, 'r')
+      handle = await fsp.open(file, 'r')
       const x = {
         path: file,
         mtime: lastModified ? (await handle.stat()).mtime.toUTCString() : null,
@@ -77,11 +103,11 @@ export default function(folder = '', {
       transform && await transform(x)
       encoding !== 'identity' && (x.bytes = await encoders[encoding](x.bytes))
       cache && caches[encoding].set(file, x)
-      aborted || send(res, x)
+      res.aborted || send(res, x)
     } catch (error) {
       handle && handle.close()
-      aborted || (error.code === 'ENOENT'
-        ? notFound(res, req)
+      res.aborted || (error.code === 'ENOENT'
+        ? notFound(res, req, notFoundHandler)
         : internalError(res, req, error)
       )
     }
@@ -97,17 +123,16 @@ export default function(folder = '', {
   }
 
   async function stream(res, req, file, type, range) {
-    let aborted
-      , stream
-      , handle
-
     res.onAborted(cleanup)
 
+    let stream
+      , handle
+
     try {
-      handle = await fs.open(file, 'r')
+      handle = await fsp.open(file, 'r')
       const { size, mtime } = await handle.stat()
 
-      if (aborted)
+      if (res.aborted)
         return cleanup()
 
       const end = parseInt(range.slice(range.indexOf('-') + 1)) || size - 1
@@ -132,15 +157,15 @@ export default function(folder = '', {
 
       stream = handle.createReadStream({ start, end })
       stream.on('error', error => {
-        aborted || internalError(res, req, error)
+        res.aborted || internalError(res, req, error)
         cleanup()
       })
       stream.on('close', () => {
-        aborted || res.end()
+        res.aborted || res.end()
         cleanup()
       })
       stream.on('data', x => {
-        if (aborted)
+        if (res.aborted)
           return stream.destroy()
 
         let lastOffset = res.getWriteOffset()
@@ -152,7 +177,7 @@ export default function(folder = '', {
         const [ok, done] = res.tryEnd(ab, total)
 
         if (done)
-          return (stream.destroy(), aborted = true)
+          return (stream.destroy(), res.aborted = true)
 
         if (ok)
           return
@@ -160,7 +185,7 @@ export default function(folder = '', {
         stream.pause()
 
         res.onWritable(offset => {
-          if (aborted)
+          if (res.aborted)
             return cleanup()
 
           const [ok, done] = res.tryEnd(
@@ -169,7 +194,7 @@ export default function(folder = '', {
           )
 
           done
-            ? aborted || (stream.destroy(), aborted = true)
+            ? res.aborted || (stream.destroy(), res.aborted = true)
             : ok
               ? stream.resume()
               : lastOffset = res.getWriteOffset()
@@ -178,20 +203,50 @@ export default function(folder = '', {
         })
       })
     } catch (error) {
-      aborted || (error.code === 'ENOENT'
-        ? notFound(res, req)
+      res.aborted || (error.code === 'ENOENT'
+        ? notFound(res, req, notFoundHandler)
         : internalError(res, req, error)
       )
       cleanup()
     }
 
     function cleanup() {
-      aborted = true
+      res.aborted = true
       handle && handle.close()
       stream && stream.destroy()
       stream = handle = null
     }
   }
+
+  function indexHandler(res, req, next) {
+    res.url.charCodeAt(res.url.length - 1) === 47 && (res.url = res.url.slice(0, -1)) // /
+    return cache && indexes.has(res.url)
+      ? indexes.get(res.url)
+      : findIndex(res, req)
+  }
+
+  function findIndex(res, req) {
+    const rewrite = res.accept.indexOf('text/html') === 0
+      ? indexResolve(res.url, '.html', root)
+      : res.accept.indexOf('text/javascript') === 0
+      && indexResolve(res.url, '.js', root)
+
+    cache && rewrite && indexes.set(res.url, rewrite)
+    return rewrite
+  }
+
+}
+
+function indexResolve(url, ext, root) {
+  return fs.existsSync(absolute(root, url, 'index' + ext))
+    ? url + '/index' + ext
+    : fs.existsSync(absolute(root, url))
+    ? url
+    : fs.existsSync(absolute(root, url + ext)) && url + ext
+}
+
+function absolute(root, url, ...xs) {
+  return path.join(root, ...url.split('/'), ...xs)
 }
 
 function getEncoding(x, supported, type) {
@@ -225,9 +280,9 @@ function notFoundHandler(res) {
   })
 }
 
-function internalErrorHandler(res) {
+function internalErrorHandler(res, req, error) {
   res.cork(() => {
     res.writeStatus('500 Internal Server Error')
-    res.end('Internal Server Error')
+    res.end('Internal Server Error: ' + error.code)
   })
 }
