@@ -4,10 +4,14 @@
   "description": "A static file serve handler for uWebSockets.js",
   "main": "index.js",
   "type": "module",
+  "bin": {
+    "ustatic": "./bin/index.js"
+  },
   "scripts": {
     "test": "echo some day"
   },
   "files": [
+    "/bin/index.js",
     "/index.js",
     "/mimes.js"
   ],
@@ -29,5 +33,8 @@
     "compression",
     "uws",
     "uWebSockets"
-  ]
+  ],
+  "devDependencies": {
+    "uWebSockets.js": "github:uNetworking/uWebSockets.js#semver:v20.x"
+  }
 }
