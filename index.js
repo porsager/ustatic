@@ -5,11 +5,18 @@ import path from 'path'
 import zlib from 'zlib'
 import { promisify } from 'node:util'
 
-const encoders = {
+const compressors = {
   identity: null,
   gzip: promisify(zlib.gzip),
   deflate: promisify(zlib.deflate),
   br: promisify(zlib.brotliCompress)
+}
+
+const streamingCompressors = {
+  identity: null,
+  gzip: zlib.createGzip,
+  deflate: zlib.createDeflate,
+  br: zlib.createBrotliCompress
 }
 
 const indexes = new Map()
@@ -27,8 +34,11 @@ export default function(folder = '', options = {}) {
     root = path.isAbsolute(folder) ? folder : path.join(process.cwd(), folder),
     index = indexHandler,
     secure = false,
-    encodings = secure ? ['br', 'gzip', 'deflate'] : ['gzip', 'deflate'],
+    compressions = secure ? ['br', 'gzip', 'deflate'] : ['gzip', 'deflate'],
     lastModified = true,
+    minStreamSize = 512 * 1024,
+    maxCacheSize = 128 * 1024,
+    minCompressSize = 1280,
     cache = true,
     notFound = notFoundHandler,
     internalError = internalErrorHandler,
@@ -77,32 +87,46 @@ export default function(folder = '', options = {}) {
     const range = req.getHeader('range')
 
     if (range)
-      return stream(res, req, file, type, range)
+      return stream(res, req, file, type, range, {})
 
-    const encoding = getEncoding(req.getHeader('accept-encoding'), encodings, type)
+    const compressor = compressions && compressions.length
+      ? getEncoding(req.getHeader('accept-encoding'), compressions, type)
+      : 'identity'
 
-    cache && caches[encoding].has(file)
-      ? send(res, caches[encoding].get(file))
-      : read(res, req, file, type, encoding)
+    cache && caches[compressor].has(file)
+      ? send(res, caches[compressor].get(file))
+      : read(res, req, file, type, compressor)
   }
 
-  async function read(res, req, file, type, encoding) {
+  async function read(res, req, file, type, compressor) {
     res.onAborted(() => res.aborted = true)
     let handle
 
     try {
       handle = await fsp.open(file, 'r')
+      const stat = await handle.stat()
+
+      if (stat.size < minCompressSize)
+        compressor = 'identity'
+
+      if (stat.size >= minStreamSize)
+        return stream(res, req, file, type, '', { handle, stat, compressor })
+
       const x = {
         path: file,
-        mtime: lastModified ? (await handle.stat()).mtime.toUTCString() : null,
+        mtime: lastModified ? stat.mtime.toUTCString() : null,
         bytes: await handle.readFile(),
-        encoding,
+        compressor,
         type
       }
+
       handle.close()
       transform && await transform(x)
-      encoding !== 'identity' && (x.bytes = await encoders[encoding](x.bytes))
-      cache && caches[encoding].set(file, x)
+
+      if (compressor !== 'identity')
+        x.bytes = await compressors[compressor](x.bytes)
+
+      cache && stat.size < maxCacheSize && caches[compressor].set(file, x)
       res.aborted || send(res, x)
     } catch (error) {
       handle && handle.close()
@@ -113,24 +137,23 @@ export default function(folder = '', options = {}) {
     }
   }
 
-  function send(res, { bytes, type, mtime, encoding }) {
+  function send(res, { path, bytes, type, mtime, compressor }) {
     res.cork(() => {
       mtime && res.writeHeader('Last-Modified', mtime)
       type && res.writeHeader('Content-Type', type)
-      encoding !== 'identity' && res.writeHeader('Content-Encoding', encoding)
+      compressor !== 'identity' && res.writeHeader('Content-Encoding', compressor)
       res.end(bytes)
     })
   }
 
-  async function stream(res, req, file, type, range) {
+  async function stream(res, req, file, type, range, { handle, stat, compressor = 'identity' }) {
     res.onAborted(cleanup)
 
     let stream
-      , handle
 
     try {
-      handle = await fsp.open(file, 'r')
-      const { size, mtime } = await handle.stat()
+      handle || (handle = await fsp.open(file, 'r'))
+      const { size, mtime } = stat || (await handle.stat())
 
       if (res.aborted)
         return cleanup()
@@ -151,11 +174,16 @@ export default function(folder = '', options = {}) {
       res.cork(() => {
         range ? res.writeStatus('206 Partial Content') : res.writeHeader('Accept-Ranges', 'bytes')
         res.writeHeader('Last-Modified', mtime.toUTCString())
+        compressor !== 'identity' && res.writeHeader('Content-Encoding', compressor)
         range && res.writeHeader('Content-Range', 'bytes ' + start + '-' + end + '/' + size)
         type && res.writeHeader('Content-Type', type)
       })
 
       stream = handle.createReadStream({ start, end })
+
+      if (compressor !== 'identity')
+        stream = stream.pipe(streamingCompressors[compressor]())
+
       stream.on('error', error => {
         res.aborted || internalError(res, req, error)
         cleanup()
@@ -262,14 +290,14 @@ function getEncoding(x, supported, type) {
     return 'identity'
 
   const accepted = parseAcceptEncoding(x, supported)
-  let encoding
+  let compressor
   for (const x of accepted) {
-    if (x.type in encoders) {
-      encoding = x.type
+    if (x.type in compressors) {
+      compressor = x.type
       break
     }
   }
-  return compressable.has(type) && encoding || 'identity'
+  return compressable.has(type) && compressor || 'identity'
 }
 
 function parseAcceptEncoding(x, preferred = []) {
