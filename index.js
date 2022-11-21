@@ -238,11 +238,19 @@ export default function(folder = '', options = {}) {
 }
 
 function indexResolve(url, ext, root) {
-  return fs.existsSync(absolute(root, url, 'index' + ext))
+  return canRead(absolute(root, url, 'index' + ext))
     ? url + '/index' + ext
-    : fs.existsSync(absolute(root, url))
+    : canRead(absolute(root, url))
     ? url
-    : fs.existsSync(absolute(root, url + ext)) && url + ext
+    : canRead(absolute(root, url + ext)) && url + ext
+}
+
+function canRead(x) {
+  try {
+    return fs.statSync(x).isFile()
+  } catch (_) {
+    return
+  }
 }
 
 function absolute(root, url, ...xs) {
