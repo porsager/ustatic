@@ -8,23 +8,23 @@ import path from 'path'
 import ustatic from '../index.js'
 import uws from 'uWebSockets.js'
 
-const args = process.argv.slice(2)
+const argv = process.argv.slice(2)
     , cwd = process.cwd()
-    , cpus = parseInt(args.find((x, i, xs) => xs[i - 1] === '--threads') || os.cpus().length)
-    , folder = args.find(x => x[0] !== '-') || '.'
+    , cpus = parseInt(argv.find((x, i, xs) => xs[i - 1] === '--threads') || os.cpus().length)
+    , folder = argv.find(x => x[0] !== '-') || '.'
     , abs = folder[0] === '/' ? folder : path.join(cwd, folder)
     , port = process.env.PORT || (process.env.SSL_CERT ? 443 : 80)
     , supportsThreads = process.platform === 'linux'
 
 const options = {
-  index: args.find((x, i, xs) => xs[i - 1] === '--index'),
+  index: argv.find((x, i, xs) => xs[i - 1] === '--index'),
   secure: process.env.SSL_CERT,
-  cache: false || !!args.find(x => x === '--cache')
+  cache: false || !!argv.find(x => x === '--cache')
 }
 
 if (supportsThreads && isMainThread) {
   for (let i = 0; i < cpus; i++)
-    new Worker(new URL(import.meta.url)) // eslint-disable-line
+    new Worker(new URL(import.meta.url), { argv }) // eslint-disable-line
 } else {
   const app = uws.App()
   app.get('/*', ustatic(abs, options))
