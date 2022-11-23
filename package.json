@@ -1,6 +1,6 @@
 {
   "name": "ustatic",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "description": "A static file serve handler for uWebSockets.js",
   "main": "index.js",
   "type": "module",
