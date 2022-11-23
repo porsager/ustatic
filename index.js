@@ -51,6 +51,7 @@ export default function(folder = '', options = {}) {
     res.url = decodeURIComponent(req.getUrl().slice(urlIndex))
     res.ext = path.extname(res.url).slice(1)
     res.accept = req.getHeader('accept')
+    res.referer = req.getHeader('referer')
     !res.ext && index
       ? rewrite(res, req, index(res, req, indexHandler, root))
       : file(res, req)
@@ -63,8 +64,10 @@ export default function(folder = '', options = {}) {
     if (rewritten === false)
       return file(res, req)
 
-    if (typeof rewritten === 'string')
+    if (typeof rewritten === 'string') {
+      res.ext = path.extname(rewritten).slice(1)
       return file(res, req, absolute(root, rewritten))
+    }
 
     res.onAborted(() => res.aborted = true)
     try {
@@ -255,9 +258,9 @@ export default function(folder = '', options = {}) {
 
   function findIndex(res, req) {
     const rewrite = res.accept.indexOf('text/html') === 0
-      ? indexResolve(res.url, '.html', root)
-      : res.accept.indexOf('text/javascript') === 0
-      && indexResolve(res.url, '.js', root)
+      ? indexResolve(res, res.url, '.html', root)
+      : res.referer.indexOf('.js') === res.referer.length - 3
+      && indexResolve(res, res.url, '.js', root)
 
     cache && rewrite && indexes.set(res.url, rewrite)
     return rewrite
@@ -265,7 +268,7 @@ export default function(folder = '', options = {}) {
 
 }
 
-function indexResolve(url, ext, root) {
+function indexResolve(res, url, ext, root) {
   return canRead(absolute(root, url, 'index' + ext))
     ? url + '/index' + ext
     : canRead(absolute(root, url))
