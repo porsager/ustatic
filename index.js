@@ -303,12 +303,12 @@ function getEncoding(x, supported, type) {
   return compressable.has(type) && compressor || 'identity'
 }
 
-function parseAcceptEncoding(x, preferred = []) {
+function parseAcceptEncoding(x, compressions = []) {
   return (x || '').split(',')
     .map(x => (x = x.split(';q='), { type: x[0].trim(), q: parseFloat(x[1] || 1) }))
-    .filter(x => x.q !== 0)
-    .sort((a, b) => b.q === a.q
-      ? preferred.indexOf(a.type) - preferred.indexOf(b.type)
+    .filter(x => x.q !== 0 && compressions.indexOf(x.type) !== -1)
+    .sort((a, b) => a.q === b.q
+      ? compressions.indexOf(a.type) - compressions.indexOf(b.type)
       : b.q - a.q)
 }
 
