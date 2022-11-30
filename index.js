@@ -46,7 +46,7 @@ export default function(folder = '', options = {}) {
     transform = null
   } = options
 
-  const urlIndex = 1 + (root === folder ? 0 : base.length)
+  const urlIndex = root === folder ? 0 : base.length
 
   return (res, req) => {
     res.url = decodeURIComponent(req.getUrl().slice(urlIndex))
