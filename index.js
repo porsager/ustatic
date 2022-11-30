@@ -36,6 +36,7 @@ export default function(folder = '', options = {}) {
     secure = false,
     compressions = secure ? ['br', 'gzip', 'deflate'] : ['gzip', 'deflate'],
     lastModified = true,
+    etag = true,
     minStreamSize = 512 * 1024,
     maxCacheSize = 128 * 1024,
     minCompressSize = 1280,
@@ -51,7 +52,6 @@ export default function(folder = '', options = {}) {
     res.url = decodeURIComponent(req.getUrl().slice(urlIndex))
     res.ext = path.extname(res.url).slice(1)
     res.accept = req.getHeader('accept')
-    res.referer = req.getHeader('referer')
     !res.ext && index
       ? rewrite(res, req, index(res, req, indexHandler, root))
       : file(res, req)
@@ -94,10 +94,10 @@ export default function(folder = '', options = {}) {
 
     const compressor = compressions && compressions.length
       ? getEncoding(req.getHeader('accept-encoding'), compressions, type)
-      : 'identity'
+      : null
 
-    cache && caches[compressor].has(file)
-      ? send(res, caches[compressor].get(file))
+    cache && caches[compressor || 'identity'].has(file)
+      ? send(res, caches[compressor || 'identity'].get(file))
       : read(res, req, file, type, compressor)
   }
 
@@ -110,14 +110,14 @@ export default function(folder = '', options = {}) {
       const stat = await handle.stat()
 
       if (stat.size < minCompressSize)
-        compressor = 'identity'
+        compressor = null
 
       if (stat.size >= minStreamSize)
         return stream(res, req, file, type, '', { handle, stat, compressor })
 
       const x = {
         path: file,
-        mtime: lastModified ? stat.mtime.toUTCString() : null,
+        mtime: stat.mtime,
         bytes: await handle.readFile(),
         compressor,
         type
@@ -126,14 +126,14 @@ export default function(folder = '', options = {}) {
       handle.close()
       transform && await transform(x)
 
-      if (compressor !== 'identity')
+      if (compressor)
         x.bytes = await compressors[compressor](x.bytes)
 
-      cache && stat.size < maxCacheSize && caches[compressor].set(file, x)
+      cache && stat.size < maxCacheSize && caches[compressor || 'identity'].set(file, x)
       res.aborted || send(res, x)
     } catch (error) {
       handle && handle.close()
-      res.aborted || (error.code === 'ENOENT'
+      res.aborted || (error.code === 'ENOENT' || error.code === 'EISDIR'
         ? notFound(res, req, notFoundHandler)
         : internalError(res, req, error)
       )
@@ -142,14 +142,20 @@ export default function(folder = '', options = {}) {
 
   function send(res, { path, bytes, type, mtime, compressor }) {
     res.cork(() => {
-      mtime && res.writeHeader('Last-Modified', mtime)
+      res.writeHeader('Connection', 'keep-alive')
+      lastModified && res.writeHeader('Last-Modified', mtime.toUTCString())
+      etag && res.writeHeader('ETag', createEtag(mtime, bytes.length, compressor))
       type && res.writeHeader('Content-Type', type)
-      compressor !== 'identity' && res.writeHeader('Content-Encoding', compressor)
+      compressor && res.writeHeader('Content-Encoding', compressor)
       res.end(bytes)
     })
   }
 
-  async function stream(res, req, file, type, range, { handle, stat, compressor = 'identity' }) {
+  function createEtag(mtime, size, weak) {
+    return (weak ? 'W/' : '') + '"' + Math.floor(mtime.getTime() / 1000).toString(16) + '-' + size.toString(16) + '"'
+  }
+
+  async function stream(res, req, file, type, range, { handle, stat, compressor }) {
     res.onAborted(cleanup)
 
     let stream
@@ -174,30 +180,50 @@ export default function(folder = '', options = {}) {
         return cleanup()
       }
 
+
+      stream = handle.createReadStream({ start, end })
+
+      if (compressor)
+        stream = stream.pipe(streamingCompressors[compressor]())
+
+      stream.on('error', error)
+            .on('close', close)
+            .on('data', compressor ? writeData : tryData)
+
       res.cork(() => {
         range ? res.writeStatus('206 Partial Content') : res.writeHeader('Accept-Ranges', 'bytes')
+        res.writeHeader('Connection', 'keep-alive')
         res.writeHeader('Last-Modified', mtime.toUTCString())
-        compressor !== 'identity' && res.writeHeader('Content-Encoding', compressor)
+        res.writeHeader('ETag', createEtag(mtime, size, compressor))
+        compressor && res.writeHeader('Content-Encoding', compressor)
         range && res.writeHeader('Content-Range', 'bytes ' + start + '-' + end + '/' + size)
         type && res.writeHeader('Content-Type', type)
       })
 
-      stream = handle.createReadStream({ start, end })
-
-      if (compressor !== 'identity')
-        stream = stream.pipe(streamingCompressors[compressor]())
-
-      stream.on('error', error => {
-        res.aborted || internalError(res, req, error)
-        cleanup()
+      compressor && res.onWritable(() => {
+        stream.resume()
+        return true
       })
-      stream.on('close', () => {
+
+      function error(x) {
+        res.aborted || internalError(res, req, x)
+        cleanup()
+      }
+
+      function close() {
         res.aborted || res.end()
         cleanup()
-      })
-      stream.on('data', x => {
+      }
+
+      function writeData(x) {
+        res.aborted
+          ? cleanup()
+          : res.write(x) || stream.pause()
+      }
+
+      function tryData(x) {
         if (res.aborted)
-          return stream.destroy()
+          return cleanup()
 
         let lastOffset = res.getWriteOffset()
         const ab = x.buffer.slice(
@@ -225,16 +251,16 @@ export default function(folder = '', options = {}) {
           )
 
           done
-            ? res.aborted || (stream.destroy(), res.aborted = true)
+            ? cleanup()
             : ok
               ? stream.resume()
               : lastOffset = res.getWriteOffset()
 
           return ok
         })
-      })
+      }
     } catch (error) {
-      res.aborted || (error.code === 'ENOENT'
+      res.aborted || (error.code === 'ENOENT' || error.code === 'EISDIR'
         ? notFound(res, req, notFoundHandler)
         : internalError(res, req, error)
       )
@@ -257,13 +283,20 @@ export default function(folder = '', options = {}) {
   }
 
   function findIndex(res, req) {
+    if (canRead(absolute(root, res.url)))
+      return req.url
+
     const rewrite = res.accept.indexOf('text/html') === 0
       ? indexResolve(res, res.url, '.html', root)
-      : res.referer.indexOf('.js') === res.referer.length - 3
-      && indexResolve(res, res.url, '.js', root)
+      : res.accept === '*/*' && indexResolve(res, res.url, '.js', root)
 
-    cache && rewrite && indexes.set(res.url, rewrite)
-    return rewrite
+    if (!rewrite)
+      return res.url
+
+    res.writeStatus('301 Moved Permanently')
+    res.writeHeader('Location', rewrite)
+    res.end()
+    return true
   }
 
 }
@@ -271,8 +304,6 @@ export default function(folder = '', options = {}) {
 function indexResolve(res, url, ext, root) {
   return canRead(absolute(root, url, 'index' + ext))
     ? url + '/index' + ext
-    : canRead(absolute(root, url))
-    ? url
     : canRead(absolute(root, url + ext)) && url + ext
 }
 
@@ -290,17 +321,17 @@ function absolute(root, url, ...xs) {
 
 function getEncoding(x, supported, type) {
   if (!x)
-    return 'identity'
+    return
 
   const accepted = parseAcceptEncoding(x, supported)
   let compressor
   for (const x of accepted) {
     if (x.type in compressors) {
-      compressor = x.type
+      compressor = x.type === 'identity' ? null : x.type
       break
     }
   }
-  return compressable.has(type) && compressor || 'identity'
+  return compressable.has(type) && compressor
 }
 
 function parseAcceptEncoding(x, compressions = []) {
