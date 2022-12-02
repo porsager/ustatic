@@ -5,6 +5,8 @@ import path from 'path'
 import zlib from 'zlib'
 import { promisify } from 'node:util'
 
+const state = ustatic.state = Symbol('ustatic')
+
 const compressors = {
   identity: null,
   gzip: promisify(zlib.gzip),
@@ -28,7 +30,7 @@ const caches = {
   identity: new Map()
 }
 
-export default function(folder = '', options = {}) {
+export default function ustatic(folder = '', options = {}) {
   const {
     base = '',
     root = path.isAbsolute(folder) ? folder : path.join(process.cwd(), folder),
@@ -37,10 +39,10 @@ export default function(folder = '', options = {}) {
     compressions = secure ? ['br', 'gzip', 'deflate'] : ['gzip', 'deflate'],
     lastModified = true,
     etag = true,
+    cache = true,
     minStreamSize = 512 * 1024,
     maxCacheSize = 128 * 1024,
     minCompressSize = 1280,
-    cache = true,
     notFound = notFoundHandler,
     internalError = internalErrorHandler,
     transform = null
@@ -49,12 +51,20 @@ export default function(folder = '', options = {}) {
   const urlIndex = root === folder ? 0 : base.length
 
   return (res, req) => {
-    res.url = decodeURIComponent(req.getUrl().slice(urlIndex))
-    res.ext = path.extname(res.url).slice(1)
-    res.accept = req.getHeader('accept')
-    !res.ext && index
+    res.hasOwnProperty(state) || (res[state] = getState(req))
+    !res[state].ext && index
       ? rewrite(res, req, index(res, req, indexHandler, root))
       : file(res, req)
+  }
+
+  function getState(req) {
+    const url = decodeURIComponent(req.getUrl().slice(urlIndex))
+        , encoding = req.getHeader('accept-encoding')
+        , accept = req.getHeader('accept')
+        , range = req.getHeader('range')
+        , ext = path.extname(url).slice(1)
+
+    return { url, accept, encoding, range, ext }
   }
 
   async function rewrite(res, req, rewritten) {
@@ -65,35 +75,26 @@ export default function(folder = '', options = {}) {
       return file(res, req)
 
     if (typeof rewritten === 'string') {
-      res.ext = path.extname(rewritten).slice(1)
+      res[state].ext = path.extname(rewritten).slice(1)
       return file(res, req, absolute(root, rewritten))
     }
 
-    res.onAborted(() => res.aborted = true)
-    try {
-      rewritten = await rewritten
-      res.aborted || (typeof rewritten === 'string'
-        ? file(res, req, absolute(root, rewritten))
-        : notFound(res, req, notFoundHandler)
-      )
-    } catch (error) {
-      res.aborted || internalError(res, req, error)
-    }
+    rewritten
+      ? file(res, req, absolute(root, rewritten))
+      : notFound(res, req, notFoundHandler)
   }
 
-  function file(res, req, file = absolute(root, res.url)) {
-    const type = mimes.get(res.ext) || mimes.get(path.extname(file))
+  function file(res, req, file = absolute(root, res[state].url)) {
+    const type = mimes.get(res[state].ext) || mimes.get(path.extname(file))
 
     if (file.indexOf(root) !== 0)
       return notFound(res, req, notFoundHandler)
 
-    const range = req.getHeader('range')
-
-    if (range)
-      return stream(res, req, file, type, range, {})
+    if (res[state].range)
+      return stream(res, req, file, type, res[state].range, {})
 
     const compressor = compressions && compressions.length
-      ? getEncoding(req.getHeader('accept-encoding'), compressions, type)
+      ? getEncoding(res[state].encoding, compressions, type)
       : null
 
     cache && caches[compressor || 'identity'].has(file)
@@ -276,22 +277,24 @@ export default function(folder = '', options = {}) {
   }
 
   function indexHandler(res, req, next) {
-    res.url.charCodeAt(res.url.length - 1) === 47 && (res.url = res.url.slice(0, -1)) // /
-    return cache && indexes.has(res.url)
-      ? indexes.get(res.url)
+    const url = res[state].url
+    url.charCodeAt(url.length - 1) === 47 && (res[state].url = url.slice(0, -1)) // /
+    return cache && indexes.has(url)
+      ? indexes.get(url)
       : findIndex(res, req)
   }
 
   function findIndex(res, req) {
-    if (canRead(absolute(root, res.url)))
-      return req.url
+    const url = res[state].url
+    if (canRead(absolute(root, url)))
+      return url
 
-    const rewrite = res.accept.indexOf('text/html') === 0
-      ? indexResolve(res, res.url, '.html', root)
-      : res.accept === '*/*' && indexResolve(res, res.url, '.js', root)
+    const rewrite = res[state].accept.indexOf('text/html') === 0
+      ? indexResolve(res, url, '.html', root)
+      : res[state].accept === '*/*' && indexResolve(res, url, '.js', root)
 
     if (!rewrite)
-      return res.url
+      return url
 
     res.writeStatus('301 Moved Permanently')
     res.writeHeader('Location', rewrite)
