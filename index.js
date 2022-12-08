@@ -45,7 +45,8 @@ export default function ustatic(folder = '', options = {}) {
     minCompressSize = 1280,
     notFound = notFoundHandler,
     internalError = internalErrorHandler,
-    transform = null
+    transform = null,
+    highWaterMark = 256 * 1024
   } = options
 
   const urlIndex = root === folder ? 0 : base.length
@@ -182,7 +183,7 @@ export default function ustatic(folder = '', options = {}) {
       }
 
 
-      stream = handle.createReadStream({ start, end })
+      stream = handle.createReadStream({ start, end, highWaterMark })
 
       if (compressor)
         stream = stream.pipe(streamingCompressors[compressor]())
@@ -191,7 +192,17 @@ export default function ustatic(folder = '', options = {}) {
             .on('close', close)
             .on('data', compressor ? writeData : tryData)
 
-      res.cork(() => {
+      res.cork(headers)
+
+      let lastOffset
+        , ab
+
+      res.onWritable(compressor
+        ? resumeWrite
+        : resumeTry
+      )
+
+      function headers() {
         range ? res.writeStatus('206 Partial Content') : res.writeHeader('Accept-Ranges', 'bytes')
         res.writeHeader('Connection', 'keep-alive')
         res.writeHeader('Last-Modified', mtime.toUTCString())
@@ -199,12 +210,7 @@ export default function ustatic(folder = '', options = {}) {
         compressor && res.writeHeader('Content-Encoding', compressor)
         range && res.writeHeader('Content-Range', 'bytes ' + start + '-' + end + '/' + size)
         type && res.writeHeader('Content-Type', type)
-      })
-
-      compressor && res.onWritable(() => {
-        stream.resume()
-        return true
-      })
+      }
 
       function error(x) {
         res.aborted || internalError(res, req, x)
@@ -226,39 +232,28 @@ export default function ustatic(folder = '', options = {}) {
         if (res.aborted)
           return cleanup()
 
-        let lastOffset = res.getWriteOffset()
-        const ab = x.buffer.slice(
-          x.byteOffset,
-          x.byteOffset + x.byteLength
-        )
+        ab = x.buffer.slice(x.byteOffset, x.byteOffset + x.byteLength)
 
+        lastOffset = res.getWriteOffset()
         const [ok, done] = res.tryEnd(ab, total)
 
-        if (done)
-          return (stream.destroy(), res.aborted = true)
+        done
+          ? (stream.destroy(), res.aborted = true)
+          : ok || stream.pause()
+      }
 
-        if (ok)
-          return
+      function resumeWrite() {
+        stream.resume()
+        return true
+      }
 
-        stream.pause()
+      function resumeTry(offset) {
+        if (res.aborted)
+          return cleanup()
 
-        res.onWritable(offset => {
-          if (res.aborted)
-            return cleanup()
-
-          const [ok, done] = res.tryEnd(
-            ab.slice(offset - lastOffset),
-            total
-          )
-
-          done
-            ? cleanup()
-            : ok
-              ? stream.resume()
-              : lastOffset = res.getWriteOffset()
-
-          return ok
-        })
+        const [ok, done] = res.tryEnd(ab.slice(offset - lastOffset), total)
+        done ? cleanup() : ok && stream.resume()
+        return ok
       }
     } catch (error) {
       res.aborted || (error.code === 'ENOENT' || error.code === 'EISDIR'
