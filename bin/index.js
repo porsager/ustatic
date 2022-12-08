@@ -19,7 +19,8 @@ const argv = process.argv.slice(2)
 const options = {
   index: argv.find((x, i, xs) => xs[i - 1] === '--index'),
   secure: process.env.SSL_CERT,
-  cache: false || !!argv.find(x => x === '--cache')
+  cache: false || !!argv.find(x => x === '--cache'),
+  compressions: argv.find(x => x === '--no-compress') ? [] : undefined
 }
 
 if (supportsThreads && isMainThread) {
